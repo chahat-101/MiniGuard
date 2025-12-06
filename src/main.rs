@@ -13,6 +13,7 @@ use hkdf::Hkdf;
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+use rand::RngCore;
 
 #[derive(Parser)]
 struct Args {
@@ -29,73 +30,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let data = args.data; //data given by the user
-    let salt =args.salt.as_bytes(); //
-    let win_tun = unsafe { wintun::load().expect("failed to load wintun") };
+    let salt =args.salt.as_bytes(); //used to generate pseudo random key from the shared secret
+    let win_tun = unsafe { wintun::load().expect("failed to load wintun") }; //this generates the wintin object wrapped in arc
 
     let adapter = match wintun::Adapter::open(&win_tun, "minguard") {
         Ok(a) => a,
         Err(_) => wintun::Adapter::create(&win_tun, "minguard", "Wintun", None)?,
-    };
+    }; //generates an adapter wrapped inside arc
 
     adapter.set_network_addresses_tuple(
         IpAddr::V4("10.0.0.2".parse().unwrap()),
         IpAddr::V4("255.255.255.0".parse().unwrap()),
         Some(IpAddr::V4("10.0.0.1".parse().unwrap())),
-    );
+    ); //this assigns ip address to the adapter
 
-    let target = String::from("127.0.0.0:4000");
+    let target = String::from("127.0.0.0:4000"); //hardcoded target ip
 
     add_ip(&target, "10.0.0.1", "minguard");
 
-    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
-    let raw_byte_data = data.as_bytes();
-    let bytes_per_packet = 64; //this is 64 kb
-    let mut total_bytes = raw_byte_data.len();
+    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap()); //this starts the adpater session
+    let raw_data = data.as_bytes();  
+    let bytes_per_packet = 64; //this is 64 kb 
+    let mut total_bytes = raw_byte_data.len(); //total bytes of data
     let i = 0;
 
     while total_bytes > 0 {
-        if total_bytes > 64 {
-            println!("ok");
-        } else {
-            let packet = &raw_byte_data[i * total_bytes..i * total_bytes + 64];
-            total_bytes -= 64;
-
-            let (secret_key,public_key) = generate_key();
-            let mut buf = [0u8; 32];
-            loop{
-                socket.send_to(public_key.as_bytes(), &target).await?;
-                let recv = timeout(Duration::from_millis(300),socket.recv_from(&mut buf)).await;
-
-                if let Ok(Ok((len,sender_socket))) = recv  {
-                    if len == 32{
-                        socket.send_to(b"ACK", &sender_socket).await?;
-                        break;
-                    }
-                }
-            }
-            let shared_secret = secret_key.diffie_hellman(&PublicKey::from(buf));
-            let hk = Hkdf::<Sha256>::new(Some(salt),shared_secret.as_bytes());
-
-            let mut key_bytes = [0u8;32];
-            hk.expand(b"chacha20poly1305 key", &mut key_bytes)
-                        .expect("HKDF expand failed");
-            
-            let nonce_bytes = [0u8;12];
-            let key = Key::from_slice(&key_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
-
-            let cipher: ChaCha20Poly1305 = ChaChaPoly1305::new(key);
-                
-            //i will not be using aad
-            let cipher_text = cipher.encrypt(nonce, packet)
-                        .expect("failed to encrypt");
-            
-            println!("cipher_text hex = {}",hex::encode(&cipher_text));    
-        }    
+        
+        if total_bytes>64{
+            send(raw_data,
+                start_index, 
+                length, 
+                socket, 
+                target, 
+                salt, 
+                data).await
+        }  
     }
     Ok(())
 }
 
+
+async fn send(raw_data:&[u8],start_index:usize,length:usize,socket:UdpSocket,target:String,salt:String,data:String) {
+    let packet = &raw_data[start_index..start_index+length];
+    let (secret_key,public_key) = generate_key();
+
+    let mut buf = [0u8;32];
+
+    loop{                           //this loop : clients sends the public key, server sends it public_key and then client sends ACK
+        socket.send_to(&public_key.to_bytes(), &target);
+        let recv = timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await;
+
+        if let Ok(Ok((len,sender_socket))) = recv{
+            if len == 32{
+                socket.send_to(b"ACK", sender_socket);
+                break;
+            }
+        }
+    }
+
+    let shared_secret = secret_key.diffie_hellman(&PublicKey::from(buf));
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared_secret.as_bytes());
+
+    let mut key_bytes = [0u8;12];
+    hk.expand(b"chacha20poly1305 key", &mut key_bytes);
+
+    let mut nonce_bytes = [0u8;32];
+    let key = Key::from_slice(&key_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let cipher:ChaCha20Poly1305 = ChaChaPoly1305::new(key);
+
+    let cipher_text = cipher.encrypt(nonce, packet)
+                .expect("failed to encrypt using chahcha20poly1305");
+    
+    println!("cipher_text hex {}",hex::encode(&cipher_text));
+    
+
+}
 
 
 
