@@ -12,7 +12,7 @@ use std::{net::IpAddr, process::Command};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, ChaChaPoly1305, Key, Nonce};
 use hkdf::Hkdf;
-use wintun;
+use wintun::{self, Packet};
 
 use rand::RngCore;
 use sha2::Sha256;
@@ -27,124 +27,131 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap(); //initialising a udpsocket
-    
+
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+
     let args = Args::parse();
     let data = args.data; //data given by the user
     let salt = args.salt.as_bytes(); //used to generate pseudo random key from the shared secret
-    let win_tun = unsafe { wintun::load().expect("failed to load wintun") }; //this generates the wintin object wrapped in arc
 
-    // let adapter = match wintun::Adapter::open(&win_tun, "minguard") {
-    //     Ok(a) => a,
-    //     Err(_) => wintun::Adapter::create(&win_tun, "minguard", "Wintun", None)?,
-    // }; //generates an adapter wrapped inside arc
+    let win_tun = unsafe { wintun::load().expect("failed to load wintun") };
 
-    // let _= adapter.set_network_addresses_tuple(
-    //     IpAddr::V4("10.0.0.2".parse().unwrap()),
-    //     IpAddr::V4("255.255.255.0".parse().unwrap()),
-    //     Some(IpAddr::V4("10.0.0.1".parse().unwrap())),
-    // )?; //this assigns ip address to the adapter
+    let adapter = match wintun::Adapter::open(&win_tun, "minguard") {
+        Ok(a) => a,
+        Err(_) => wintun::Adapter::create(&win_tun, "wintun", "Wintun", None)?,
+    };
+
+    adapter.set_network_addresses_tuple(
+        IpAddr::V4("10.0.0.2".parse().unwrap()), // client virtual IP
+        IpAddr::V4("255.255.255.0".parse().unwrap()), // netmask
+        Some(IpAddr::V4("10.0.0.1".parse().unwrap())), // gateway IP (server side)
+    )?;
+    
+    let demo_target_ip = "203.0.113.10";
+
+    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
+    println!("Wintun session started");
 
     let target: SocketAddr = args.target.parse().expect("invalid address");
-    // let _ = add_ip(&target.to_string(), "10.0.0.1", "minguard");
 
-    // let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap()); //this starts the adpater session
-    let raw_data = data.as_bytes();
+    let session_rx = session.clone();
+    let socket_tx = socket.clone();
+    let target_addr = target.clone();
+    let salt_clone = salt.to_vec();
 
-    let mut total_bytes = raw_data.len(); //total bytes of data
+    tokio::spawn(async move {
+        loop {
+            let packet = match session_rx.receive_blocking() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[client] Wintun receive error: {e:?}");
+                    continue;
+                }
+            };
+            let ip_packet = packet.bytes();
 
-    let mut i = 0;
-    while total_bytes > 0 {
-        let chunk_size = std::cmp::min(total_bytes, 1400);
-        let start = i * 1400;
-        send(
-            raw_data,
-            start,
-            chunk_size,
-            &socket,
-            &target,
-            String::from("this is some salt"),
-            &data,
-        )
-        .await?;
-        total_bytes -= chunk_size;
-        i += 1;
-    }
-    loop {
-        let end_flag = b"END";
-        let mut recv_flag = [0u8; 3];
-        socket.send_to(end_flag, &target).await?;
+            if let Err(e) = 
+                    send_encrypted_packet(ip_packet, &socket_tx, &target_addr, &salt_clone).await{
+                        eprintln!("[client] Error sending encrypted packet: {e}");
+                    }
         
-        let recv = timeout(Duration::from_millis(400), socket.recv_from(&mut recv_flag)).await;
-        if let Ok(Ok((_len, addr))) = recv {
-            if &recv_flag == end_flag && addr == target {
-                println!("All packets sent successfully!");
-                break;
-            }
         }
+    });
+
+    println!(
+        "[client] tunnel running. Try something like:\n ping {}"
+        ,demo_target_ip
+    );
+
+    loop{
+        tokio::time::sleep(Duration::from_millis(3600)).await;
     }
-    Ok(())
 }
 
-async fn send(
-    raw_data: &[u8],
-    start_index: usize,
-    length: usize,
-    socket: &UdpSocket,
-    target: &SocketAddr,
-    salt: String,
-    data: &String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let packet = &raw_data[start_index..start_index + length];
-    let (secret_key, public_key) = generate_key();
 
-    let mut buf = [0u8; 32];
+async fn send_encrypted_packet(
+    packet:&[u8],
+    socket:&UdpSocket,
+    target:&SocketAddr,
+    salt:&[u8]
+) -> Result<(),Box<dyn std::error::Error>> {
+    
+    let (secret_key,public_key) = generate_key();
+    let mut server_pub = [0u8;32];
 
-    loop {
-        //this loop : clients sends the public key, server sends it public_key and then client sends ACK
-        socket.send_to(&public_key.to_bytes(), target).await?;
-        let recv = timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await;
 
-        if let Ok(Ok((len, sender_socket))) = recv {
-            if len == 32 {
-                socket.send_to(b"ACK", sender_socket).await?;
+    loop{
+        socket.send_to(public_key.as_bytes(), target);
+        let recv = timeout(Duration::from_millis(400), socket.recv_from(&mut server_pub)).await;
+        if let Ok(Ok((_len,addr))) = recv{
+            if addr == *target{
+                socket.send_to(b"ACK", target).await?;
                 break;
             }
         }
     }
 
-    let shared_secret = secret_key.diffie_hellman(&PublicKey::from(buf));
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared_secret.as_bytes());
+    let shared_secret = secret_key.diffie_hellman(&PublicKey::from(server_pub));
+    let hk = Hkdf::<Sha256>::new(Some(salt),shared_secret.as_bytes());
 
-    let mut key_bytes = [0u8; 32];
-    let _ = hk.expand(b"chacha20poly1305 key", &mut key_bytes);
+    let mut key_bytes = [0u8;32];
+    hk.expand(b"chacha20poly1305 key", &mut key_bytes)
+    .map_err(|_| -> Box<dyn std::error::Error> {
+        "HKDF expand InvalidLength".into()
+    })?;
 
-    let mut nonce_bytes = [0u8; 12];
+
     let key = Key::from_slice(&key_bytes);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
 
+    let mut nonce_bytes = [0u8;12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let cipher: ChaCha20Poly1305 = ChaChaPoly1305::new(key);
-
+    let cipher = ChaCha20Poly1305::new(key);
     let cipher_text = cipher
-        .encrypt(nonce, packet)
-        .expect("failed to encrypt using chahcha20poly1305");
+            .encrypt(nonce, packet)
+            .map_err(|e| format!("AEAD encryption failed: {e}"))?;
 
-    loop {
-        socket.send_to(&cipher_text, target).await?;
-        let mut flag = [0u8; 3];
-        let FLAG = b"ACK";
-        let recv = timeout(Duration::from_millis(400), socket.recv_from(&mut flag)).await;
-        let (len, sender) = match recv? {
-            Ok(a) => a,
-            Err(e) => return Err(e.into()),
-        };
-        if &flag == FLAG && &sender == target {
-            break;
+
+    let mut out = Vec::with_capacity(12+cipher_text.len());
+
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&cipher_text);
+
+    let mut ack = [0u8;3];
+
+    loop{
+        socket.send_to(&out, target).await?;
+        let recv = timeout(Duration::from_millis(400), socket.recv_from(&mut ack)).await;
+        if let Ok(Ok((_l,addr))) = recv{
+            if &ack == b"ACK" && addr == *target{
+                break; 
+            }
         }
-    }
-    println!("cipher_text hex {}", hex::encode(&cipher_text));
 
+    }
+
+
+    
     Ok(())
 }

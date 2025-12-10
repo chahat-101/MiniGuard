@@ -18,26 +18,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let (n, addr) = socket.recv_from(&mut buf).await?;
         if n == 32 {
-            println!("Received public key from {}",addr);
-
+            println!("Received public key from {}", addr);
 
             socket.send_to(public_key.as_bytes(), addr).await?;
             let mut flag = [0u8; 3];
             let (_len, sender) = socket.recv_from(&mut flag).await?;
 
-
             if &flag == b"ACK" && sender == addr {
                 println!("Handshake complete with {}", addr);
-                
+
                 let shared_secret = secret_key.diffie_hellman(&PublicKey::from(buf));
                 shared_secrets.push(shared_secret);
                 receive_packet(&sender, &socket, &mut packets).await?;
-                packet_count+=1;
-
+                packet_count += 1;
             }
-        } //n == 32
-        else if n == 3 && &buf[..3] == b"END"{
-            println!("Received END from {}",addr);
+        }
+        //n == 32
+        else if n == 3 && &buf[..3] == b"END" {
+            println!("Received END from {}", addr);
             socket.send_to(b"END", addr).await?;
             break;
         } // n == 3
@@ -45,7 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nAll packets:");
     for (i, packet) in packets.iter().enumerate() {
-        println!("Packet {}: {} bytes - {}", i, packet.len(), hex::encode(&packet[..packet.len().min(32)]));
+        println!(
+            "Packet {}: {} bytes - {}",
+            i,
+            packet.len(),
+            hex::encode(&packet[..packet.len().min(32)])
+        );
     }
 
     Ok(())
